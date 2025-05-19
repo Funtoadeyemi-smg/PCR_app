@@ -1,0 +1,6 @@
+boto3
+openai
+pandas
+python-pptx
+python-dotenv
+tiktoken
