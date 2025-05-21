@@ -15,6 +15,8 @@ import base64
 import matplotlib.pyplot as plt
 from datetime import datetime
 from pptx.util import Inches
+from pptx.oxml import parse_xml
+from pptx.oxml.ns import qn
 
 load_dotenv()
 api_key = os.getenv('OPENAI_API_KEY')
@@ -29,7 +31,7 @@ class PowerPointProcessor:
         self.pptx_file = pptx_file
         self.prs = Presentation(pptx_file)
 
-    def replace_placeholders(self, replacements, output_pptx):
+    def replace_placeholders(self, replacements, is_pin, output_pptx):
         """
         Replaces placeholders in a PowerPoint presentation with provided values, including text inside tables.
         
@@ -62,6 +64,20 @@ class PowerPointProcessor:
                                             found_placeholders.add(placeholder)
                                             run.text = run.text.replace(placeholder, str(replacement))
 
+            for shape in slide.shapes:
+                if shape.has_table:
+                    table = shape.table
+                    rows_to_remove = []
+                    for i, row in enumerate(table.rows):
+                        texts = [cell.text.strip() for cell in row.cells]
+                        if all("{" in text and "}" in text for text in texts):  # all look like placeholders
+                            rows_to_remove.append(i)
+
+                    for i in reversed(rows_to_remove):  # delete from bottom up to keep index stable
+                        tbl = table._tbl
+                        tr = tbl.tr_lst[i]
+                        tbl.remove(tr)
+
         try:
             chart_slide = self.prs.slides[8]  # Slide 10
             for shape in chart_slide.shapes:
@@ -75,11 +91,22 @@ class PowerPointProcessor:
         except FileNotFoundError as e:
             print(f"⚠️ Image file not found: {e.filename}")    
 
+        if not is_pin:
+            # Delete slides 27, 28, and 29 by index (in reverse order to avoid reindexing issues)
+            for i in [28, 27, 26, 25]:
+                try:
+                    xml_slides = self.prs.slides._sldIdLst
+                    slide_id = xml_slides[i]
+                    xml_slides.remove(slide_id)
+                except IndexError:
+                    print(f"⚠️ Slide index {i+1} not found – skipping deletion.")
+
+
         self.prs.save(output_pptx)
 
         # Debugging output
         print(f"Updated presentation saved as: {output_pptx}")
-        print("Placeholders found and replaced:", found_placeholders)
+        print("Placeholders found and replaced")
 
         if not found_placeholders:
             print("⚠️ No placeholders were replaced. Check if placeholders in the PPT match replacements keys.")
@@ -92,6 +119,7 @@ class DataExtractor:
         self.media_plan_file = media_plan_file
         self.prompt_file = prompt_file
         self.replacements = {}
+        self.is_pin =True
 
     def open_file(self, filepath):
         with open(filepath, 'r', encoding='utf-8') as infile:
@@ -150,7 +178,7 @@ class DataExtractor:
     def extract_values(self):
         meta = pd.read_excel(self.meta_file)
         pinterest = pd.read_csv(self.pinterest_file) if self.pinterest_file else None
-        media_plan = pd.read_excel(self.media_plan_file, sheet_name="Media Plan - V3 ", skiprows=7, skipfooter=3) if self.media_plan_file else None
+        media_plan = pd.read_excel(self.media_plan_file, skiprows=7, skipfooter=3) if self.media_plan_file else None
         prompt = self.open_file(self.prompt_file) if self.prompt_file else ""
 
         # ========== Meta data =============
@@ -236,6 +264,7 @@ class DataExtractor:
 
  
         else:
+            self.is_pin = False
             net_spend_pin = gross_spend_pin = impressions_pin = clicks_pin = CTR_pin  = 0
             net_CPM_pin = brand_revenue_pin = brand_ROAS_pin =  brand_instore_revenue_pin =  brand_online_revenue_pin = brand_ROI_pin = 0
             pin_input = 'None'
@@ -293,15 +322,82 @@ class DataExtractor:
 
         # ========== Media Plan Estimates =============
         if media_plan is not None:
+            def parse_date_range(date_text):
+                """
+                Parse various date range formats including:
+                - DD/MM/YYYY - DD/MM/YYYY
+                - DD Month - DD Month YYYY
+                - DDth Month - DDth Month YYYY
+                """
+                # Try standard format first: DD/MM/YYYY - DD/MM/YYYY
+                standard_ranges = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})', date_text)
+                if standard_ranges:
+                    return [(datetime.strptime(start, "%d/%m/%Y"), datetime.strptime(end, "%d/%m/%Y")) 
+                            for start, end in standard_ranges]
+                
+                # Try format: DDth Month - DDth Month YYYY
+                # This pattern captures dates like "10th December - 23rd December 2024"
+                month_names = "January|February|March|April|May|June|July|August|September|October|November|December"
+                pattern = rf'(\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{month_names}))\s*-\s*(\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{month_names})(?:\s+\d{{4}})?)'
+                
+                textual_ranges = re.findall(pattern, date_text, re.IGNORECASE)
+                
+                if not textual_ranges:
+                    return []
+                
+                parsed_dates = []
+                for start_date, end_date in textual_ranges:
+                    # Check if year is in end_date, if not try to extract from the original text
+                    if not re.search(r'\d{4}', end_date):
+                        # Try to find a year in the original text
+                        year_match = re.search(r'\b(\d{4})\b', date_text)
+                        year = year_match.group(1) if year_match else str(datetime.now().year)
+                        # Add year to both start and end dates
+                        start_date = f"{start_date} {year}"
+                        end_date = f"{end_date}"  # Year should already be included
+                    
+                    # Clean up ordinal indicators (st, nd, rd, th)
+                    start_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', start_date)
+                    end_date = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', end_date)
+                    
+                    try:
+                        # Parse the dates
+                        start_dt = datetime.strptime(start_date, "%d %B %Y")
+                        end_dt = datetime.strptime(end_date, "%d %B %Y")
+                        parsed_dates.append((start_dt, end_dt))
+                    except ValueError as e:
+                        print(f"Error parsing date: {e}, start_date: {start_date}, end_date: {end_date}")
+                        continue
+                
+                return parsed_dates
+
+            # Usage in your existing code
             media_plan = media_plan[['Platform', 'Estimated Impressions', 'Estimated link clicks', 'Estimated Frequency', 'Estimated Reach', 'Gross spend by channel / platform', 'Estimated CTR', 'Net CPM', 'Flight duration']]
             media_plan['Platform'] = media_plan['Platform'].fillna(method='ffill')
             media_plan['Flight duration'] = media_plan['Flight duration'].fillna(method='ffill')
-            media_plan_clean = media_plan.dropna()
-            date_text = str(media_plan_clean['Flight duration'][0])
-            date_ranges = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})', date_text)
-            parsed_ranges = [(datetime.strptime(start, "%d/%m/%Y"), datetime.strptime(end, "%d/%m/%Y")) for start, end in date_ranges]
-            latest_range = max(parsed_ranges, key=lambda r: r[1])
-            date_range = f"{latest_range[0].strftime('%d/%m/%Y')} - {latest_range[1].strftime('%d/%m/%Y')}"
+            #media_plan_clean = media_plan.dropna()
+            media_plan_clean = media_plan.dropna(thresh=media_plan.shape[1] - 4 + 1)
+            media_plan_clean = media_plan_clean.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+            try:
+                date_text = str(media_plan_clean['Flight duration'][0])
+                parsed_ranges = parse_date_range(date_text)
+                
+                if parsed_ranges:
+                    latest_range = max(parsed_ranges, key=lambda r: r[1])
+                    # Format for display - you can adjust format as needed
+                    date_range = f"{latest_range[0].strftime('%d/%m/%Y')} - {latest_range[1].strftime('%d/%m/%Y')}"
+                else:
+                    print(f"No valid date ranges found in: '{date_text}'")
+                    # Fallback to original text or current date range
+                    date_range = date_text
+            except Exception as e:
+                print(f"Error processing date range: {e}")
+                # Fallback to current date
+                today = datetime.now()
+                date_range = f"{today.strftime('%d/%m/%Y')} - {today.strftime('%d/%m/%Y')}"
+            
+            # Group calculations
             estimated_impression = media_plan_clean.groupby('Platform')['Estimated Impressions'].sum()
             estimated_clicks = media_plan_clean.groupby('Platform')['Estimated link clicks'].sum()
             estimated_reach = media_plan_clean.groupby('Platform')['Estimated Reach'].sum()
@@ -310,25 +406,42 @@ class DataExtractor:
             est_click_sum = estimated_clicks.sum().astype(int)
             est_reach_sum = float(estimated_reach.sum())
             est_gross_sum = float(estimated_gross_spend.sum())
+            
+            # Meta calculations (always present)
             est_ctr_meta = media_plan_clean[media_plan_clean['Platform'] == 'Meta (Facebook & Instagram)']['Estimated CTR'].iloc[0] * 100
             est_cpm_meta = media_plan_clean[media_plan_clean['Platform'] == 'Meta (Facebook & Instagram)']['Net CPM'].iloc[0]
             est_imp_meta = int(estimated_impression['Meta (Facebook & Instagram)'])
             est_clicks_meta = int(estimated_clicks['Meta (Facebook & Instagram)'])
             est_reach_meta = int(estimated_reach['Meta (Facebook & Instagram)'])
             est_gross_meta = int(estimated_gross_spend['Meta (Facebook & Instagram)'])
-            est_ctr_pin = media_plan_clean[media_plan_clean['Platform'] == 'Pinterest']['Estimated CTR'].iloc[0] * 100
-            est_cpm_pin = media_plan_clean[media_plan_clean['Platform'] == 'Pinterest']['Net CPM'].iloc[0]
-            est_imp_pin = int(estimated_impression['Pinterest'])
-            est_clicks_pin = int(estimated_clicks['Pinterest'])
-            est_reach_pin = int(estimated_reach['Pinterest'])
-            est_gross_pin = int(estimated_gross_spend['Pinterest'])
-
-            est_ctr_sum = (est_ctr_meta + est_ctr_pin) / 2
-            est_cpm_sum = (est_cpm_meta + est_cpm_pin) / 2
+            
+            # Check if Pinterest exists in the Platform column
+            has_pinterest = 'Pinterest' in media_plan_clean['Platform'].values
+            
+            if has_pinterest:
+                # Pinterest calculations if available
+                est_ctr_pin = media_plan_clean[media_plan_clean['Platform'] == 'Pinterest']['Estimated CTR'].iloc[0] * 100
+                est_cpm_pin = media_plan_clean[media_plan_clean['Platform'] == 'Pinterest']['Net CPM'].iloc[0]
+                est_imp_pin = int(estimated_impression['Pinterest'])
+                est_clicks_pin = int(estimated_clicks['Pinterest'])
+                est_reach_pin = int(estimated_reach['Pinterest'])
+                est_gross_pin = int(estimated_gross_spend['Pinterest'])
+                
+                # Calculate average values using both platforms
+                est_ctr_sum = (est_ctr_meta + est_ctr_pin) / 2
+                est_cpm_sum = (est_cpm_meta + est_cpm_pin) / 2
+            else:
+                # Set Pinterest values to 0 if not present
+                est_ctr_pin = est_cpm_pin = 0
+                est_imp_pin = est_clicks_pin = est_reach_pin = est_gross_pin = 0
+                
+                # Use only Meta values for summary calculations
+                est_ctr_sum = est_ctr_meta
+                est_cpm_sum = est_cpm_meta
 
             # Performance vs estimate
-            perc_imp = ((total_impressions - est_imp_sum) / est_imp_sum) * 100
-            perc_clicks = ((total_clicks - est_click_sum) / est_click_sum) * 100
+            perc_imp = ((total_impressions - est_imp_sum) / est_imp_sum) * 100 if est_imp_sum != 0 else 0
+            perc_clicks = ((total_clicks - est_click_sum) / est_click_sum) * 100 if est_click_sum != 0 else 0
 
             # Slide-level data for JSON
 
@@ -356,7 +469,8 @@ class DataExtractor:
         prompt = prompt.replace('<<online_and_instore>>', online_offline_json)
         prompt = prompt.replace('<<audience_data>>', audience_json)
         campaign_commentary = self.gpt4_completion(prompt)                                                                              #Run gpt function and save the output
-        commentary_json = json.loads(campaign_commentary)  
+        commentary_json = json.loads(campaign_commentary)
+        print("Commentary JSON:", commentary_json)  # Debugging output
 
         #=============================================================Call graph plotting function  ==================================================================================
 
@@ -490,7 +604,7 @@ class DataExtractor:
                 f"{{p_ROI_{idx}}}": f"{row['Brand_ROI']:.2f}"
 
             })
-        return self.replacements
+        return self.replacements, self.is_pin
 
 st.markdown("""
     <style>
@@ -566,7 +680,7 @@ if "media_plan_file" not in st.session_state:
 st.title("📊 Post-Campaign Report Generator")
 
 st.markdown("""
-Upload your campaign files below. At minimum, a Meta Excel/csv file is required.
+Upload your campaign files below. At minimum, a Meta Excel/csv file is required. Ensure data columns align to column name requirements
 """)
 
 # Handle file uploads with unique keys that change when reset is pressed
@@ -599,7 +713,7 @@ col1, col2, col3, col4 = st.columns(4)
 with col1:
     if st.button("Generate PowerPoint Report"):
         if not st.session_state.meta_file:
-            st.error("Please upload at least Meta file, Prompt file, and PowerPoint template.")
+            st.error("Please upload at least a Meta file.")
         else:
             with tempfile.TemporaryDirectory() as tmpdir:
                 # Save uploaded files temporarily
@@ -638,11 +752,11 @@ with col1:
                 # Run processing
                 with st.spinner("⏳ Generating your PowerPoint report..."):
                     extractor = DataExtractor(meta_path, pin_path, media_path, prompt_path)
-                    replacements = extractor.extract_values()
+                    replacements, is_pin = extractor.extract_values()
 
                     output_path = os.path.join(tmpdir, "automated_presentation.pptx")
                     ppt = PowerPointProcessor(ppt_template_path)
-                    ppt.replace_placeholders(replacements, output_path)
+                    ppt.replace_placeholders(replacements, is_pin, output_path)
 
                 # Download output
                 with open(output_path, "rb") as file:
