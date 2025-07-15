@@ -314,6 +314,8 @@ class DataExtractor:
         data2 = {"total_brand_online_revenue": total_brand_online_rev, "total_brand_instore_revenue": total_brand_instore_rev}
         online_offline_json = json.dumps(data2, indent=4)
         merged_audience_metrics = pd.concat([combined_meta_df, combined_pin_df]).groupby('Ad_Set_Name', as_index=False).sum()
+        cols_to_check = merged_audience_metrics.columns[1:]  # Skip first column
+        merged_audience_metrics = merged_audience_metrics[((merged_audience_metrics[cols_to_check] == 0) | merged_audience_metrics[cols_to_check].isna()).sum(axis=1) / len(cols_to_check) < 0.8]
         merged_audience_metrics.drop(columns=['Brand_ROI', 'CTR', 'Net_CPM'], inplace=True)
         merged_audience_metrics['Brand_ROI'] = merged_audience_metrics['Brand_Revenue'] / merged_audience_metrics['Gross_Spend']
         merged_audience_metrics['CTR'] = merged_audience_metrics['Clicks'] / merged_audience_metrics['Impressions'] * 100
